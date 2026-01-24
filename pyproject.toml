@@ -1,0 +1,9 @@
+[project]
+name = "treedu"
+version = "0.1.0"
+description = "Interactive directory size viewer with periodic refresh and change highlighting."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "watchdog>=6.0.0",
+]
