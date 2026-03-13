@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive directory size viewer with periodic refresh and change highlighting."""
+"""Interactive directory size and file-count viewer with periodic refresh."""
 
 import argparse
 import collections
@@ -9,6 +9,8 @@ import queue
 import threading
 import time
 from typing import DefaultDict, Dict, List, Tuple
+
+SORT_COLUMNS = ("name", "files", "subtree_files", "initial", "current", "delta")
 
 
 def human_readable(size: int) -> str:
@@ -22,11 +24,61 @@ def human_readable(size: int) -> str:
     return f"{value:.0f}{units[-1]}"
 
 
+def display_name(path: str, root: str, depth: int) -> str:
+    """Return the indented label shown for a directory."""
+    name = "." if path == root else os.path.basename(path.rstrip(os.sep)) or path
+    indent = "  " * depth
+    return f"{indent}{name}"
+
+
+def sort_value(
+    path: str,
+    sort_column: str,
+    root: str,
+    initial_sizes: Dict[str, int],
+    current_sizes: Dict[str, int],
+    file_counts: Dict[str, int],
+    total_file_counts: Dict[str, int],
+    deltas: Dict[str, int],
+):
+    """Return the per-column sort key for a path."""
+    if sort_column == "name":
+        return display_name(path, root, 0).casefold()
+    if sort_column == "files":
+        return file_counts.get(path, 0)
+    if sort_column == "subtree_files":
+        return total_file_counts.get(path, 0)
+    if sort_column == "initial":
+        return initial_sizes.get(path, 0)
+    if sort_column == "current":
+        return current_sizes.get(path, 0)
+    return deltas.get(path, 0)
+
+
+def human_readable_count(count: int) -> str:
+    """Format counts with decimal suffixes."""
+    units = ["", "K", "M", "B", "T"]
+    value = float(count)
+    for unit in units:
+        if abs(value) < 1000 or unit == units[-1]:
+            if unit == "":
+                return f"{int(value)}"
+            if value >= 100:
+                return f"{value:.0f}{unit}"
+            if value >= 10:
+                return f"{value:.1f}{unit}"
+            return f"{value:.2f}{unit}"
+        value /= 1000
+    return f"{value:.0f}{units[-1]}"
+
+
 def scan_directory_with_progress(
     root: str, progress_cb=None
-) -> Tuple[Dict[str, int], DefaultDict[str, List[str]]]:
-    """Walk the tree and return aggregate sizes per directory plus child mapping."""
+) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int], DefaultDict[str, List[str]]]:
+    """Walk the tree and return aggregate sizes, file counts, and child mapping."""
     sizes: Dict[str, int] = {}
+    file_counts: Dict[str, int] = {}
+    total_file_counts: Dict[str, int] = {}
     children: DefaultDict[str, List[str]] = collections.defaultdict(list)
 
     # Pre-count directories for progress percentages.
@@ -37,6 +89,7 @@ def scan_directory_with_progress(
 
     for dirpath, dirnames, filenames in os.walk(root, topdown=False):
         total = 0
+        subtree_files = len(filenames)
         for fname in filenames:
             fpath = os.path.join(dirpath, fname)
             try:
@@ -48,10 +101,13 @@ def scan_directory_with_progress(
         for dirname in dirnames:
             child_path = os.path.join(dirpath, dirname)
             total += sizes.get(child_path, 0)
+            subtree_files += total_file_counts.get(child_path, 0)
             children[dirpath].append(child_path)
 
         children[dirpath].sort()
         sizes[dirpath] = total
+        file_counts[dirpath] = len(filenames)
+        total_file_counts[dirpath] = subtree_files
         processed_dirs += 1
         if progress_cb:
             progress_cb(min(1.0, processed_dirs / max(1, total_dirs)))
@@ -59,18 +115,22 @@ def scan_directory_with_progress(
     if root not in children:
         children[root] = []
 
-    return sizes, children
+    return sizes, file_counts, total_file_counts, children
 
 
 def build_visible(
     root: str,
     children: Dict[str, List[str]],
     expanded: set,
-    size_map: Dict[str, int],
+    initial_sizes: Dict[str, int],
+    current_sizes: Dict[str, int],
+    file_counts: Dict[str, int],
+    total_file_counts: Dict[str, int],
     deltas: Dict[str, int],
     filter_deltas: bool,
+    sort_column: str,
 ) -> List[Tuple[str, int]]:
-    """Flatten the expanded tree into a list with depth values for rendering, sorted by size."""
+    """Flatten the expanded tree into a list with depth values for rendering."""
     visible: List[Tuple[str, int]] = []
     stack: List[Tuple[str, int]] = [(root, 0)]
 
@@ -79,9 +139,23 @@ def build_visible(
         if not filter_deltas or deltas.get(path, 0) != 0:
             visible.append((path, depth))
         if path in expanded:
+            reverse_sort = sort_column != "name"
             ordered_children = sorted(
                 children.get(path, []),
-                key=lambda p: (-size_map.get(p, 0), p),
+                key=lambda p: (
+                    sort_value(
+                        p,
+                        sort_column,
+                        root,
+                        initial_sizes,
+                        current_sizes,
+                        file_counts,
+                        total_file_counts,
+                        deltas,
+                    ),
+                    display_name(p, root, 0),
+                ),
+                reverse=reverse_sort,
             )
             for child in reversed(ordered_children):
                 stack.append((child, depth + 1))
@@ -102,6 +176,9 @@ def render(
     visible: List[Tuple[str, int]],
     initial_sizes: Dict[str, int],
     current_sizes: Dict[str, int],
+    file_counts: Dict[str, int],
+    total_file_counts: Dict[str, int],
+    sort_column: str,
     selected: int,
     last_scan: float,
     mode_text: str,
@@ -153,6 +230,7 @@ def render(
     controls = [
         ("q", "quit"),
         ("⤧", "navigation"),
+        ("s", "cycle sort"),
         ("R", "rebase subtree"),
         ("f", "filter Δ only" if not filter_deltas else "show all"),
         ("events", "auto-refresh"),
@@ -166,27 +244,43 @@ def render(
         safe_add(row, col, f"{desc}  ", curses.A_DIM)
         col += len(desc) + 2
 
-    numeric_width = 12 * 3
+    direct_count_width = 8
+    total_count_width = 10
+    size_width = 12
+    numeric_width = direct_count_width + total_count_width + (size_width * 3)
     available_for_names = max(10, width - numeric_width)
-
-    def display_text(path: str, depth: int) -> str:
-        name = "." if path == root else os.path.basename(path.rstrip(os.sep)) or path
-        indent = "  " * depth
-        return f"{indent}{name}"
 
     longest_name = 0
     for path, depth in visible:
-        longest_name = max(longest_name, len(display_text(path, depth)))
+        longest_name = max(longest_name, len(display_name(path, root, depth)))
 
     name_col_width = min(max(20, longest_name + 2), available_for_names)
 
-    header = (
-        "Folder".ljust(name_col_width)
-        + "Initial".rjust(12)
-        + "Current".rjust(12)
-        + "Delta".rjust(12)
-    )
-    safe_add(4, 0, header[:width], curses.A_UNDERLINE)
+    header_columns = [
+        ("name", "Folder", name_col_width, "left"),
+        ("files", "Files", direct_count_width, "right"),
+        ("subtree_files", "Subtree", total_count_width, "right"),
+        ("initial", "Initial", size_width, "right"),
+        ("current", "Current", size_width, "right"),
+        ("delta", "Delta", size_width, "right"),
+    ]
+    header_col = 0
+    for column_key, label, column_width, align in header_columns:
+        is_active = column_key == sort_column
+        content_width = max(0, column_width - (1 if is_active else 0))
+        if align == "left":
+            header_text = label.ljust(content_width if is_active else column_width)
+        else:
+            header_text = label.rjust(content_width if is_active else column_width)
+        safe_add(4, header_col, header_text, curses.A_UNDERLINE)
+        if is_active and column_width > 0:
+            safe_add(
+                4,
+                header_col + column_width - 1,
+                "↓",
+                curses.color_pair(3) | curses.A_BOLD | curses.A_UNDERLINE,
+            )
+        header_col += column_width
 
     deltas = [current_sizes.get(p, 0) - initial_sizes.get(p, 0) for p, _ in visible]
     max_abs_delta = max((abs(d) for d in deltas), default=0)
@@ -197,7 +291,7 @@ def render(
         if row >= height:
             break
 
-        name = display_text(path, depth)
+        name = display_name(path, root, depth)
         if len(name) > name_col_width:
             if name_col_width > 3:
                 name = name[: name_col_width - 3] + "..."
@@ -206,14 +300,18 @@ def render(
 
         initial = initial_sizes.get(path, 0)
         current = current_sizes.get(path, 0)
+        direct_files = file_counts.get(path, 0)
+        subtree_files = total_file_counts.get(path, 0)
         delta = current - initial
         delta_sign = "+" if delta > 0 else ""
         delta_text = f"{delta_sign}{human_readable(delta)}"
 
         line_prefix = (
             name.ljust(name_col_width)
-            + human_readable(initial).rjust(12)
-            + human_readable(current).rjust(12)
+            + human_readable_count(direct_files).rjust(direct_count_width)
+            + human_readable_count(subtree_files).rjust(total_count_width)
+            + human_readable(initial).rjust(size_width)
+            + human_readable(current).rjust(size_width)
         )
 
         row_attr = curses.A_NORMAL
@@ -239,11 +337,11 @@ def scan_worker(
     while not stop_event.is_set():
         scanning_event.set()
         result_queue.put(("progress", 0.0))
-        sizes, children = scan_directory_with_progress(
+        sizes, file_counts, total_file_counts, children = scan_directory_with_progress(
             root, progress_cb=lambda pct: result_queue.put(("progress", pct))
         )
         scanning_event.clear()
-        result_queue.put((time.time(), sizes, children))
+        result_queue.put((time.time(), sizes, file_counts, total_file_counts, children))
 
         # Sleep until next interval or exit.
         stop_event.wait(interval)
@@ -270,28 +368,42 @@ def coalesce_paths(paths: List[str]) -> List[str]:
 
 
 def integrate_subtree(
-    root: str, target: str, sizes: Dict[str, int], children: Dict[str, List[str]]
+    root: str,
+    target: str,
+    sizes: Dict[str, int],
+    file_counts: Dict[str, int],
+    total_file_counts: Dict[str, int],
+    children: Dict[str, List[str]],
 ) -> None:
-    """Re-scan a subtree and merge results into the aggregated sizes and children maps."""
+    """Re-scan a subtree and merge results into the aggregated maps."""
     old_subtree_paths = [p for p in list(sizes) if p == target or p.startswith(target + os.sep)]
     old_root_size = sizes.get(target, 0)
+    old_root_total_files = total_file_counts.get(target, 0)
 
     for p in old_subtree_paths:
         sizes.pop(p, None)
+        file_counts.pop(p, None)
+        total_file_counts.pop(p, None)
         children.pop(p, None)
 
-    new_sizes, new_children = scan_directory_with_progress(target)
+    new_sizes, new_file_counts, new_total_file_counts, new_children = scan_directory_with_progress(
+        target
+    )
     sizes.update(new_sizes)
+    file_counts.update(new_file_counts)
+    total_file_counts.update(new_total_file_counts)
     for path, kids in new_children.items():
         children[path] = kids
 
     new_root_size = new_sizes.get(target, 0)
-    delta = new_root_size - old_root_size
+    size_delta = new_root_size - old_root_size
+    total_file_delta = new_total_file_counts.get(target, 0) - old_root_total_files
 
-    # Propagate size delta up the ancestor chain.
+    # Propagate aggregate deltas up the ancestor chain.
     parent = os.path.dirname(target)
     while parent and parent.startswith(root):
-        sizes[parent] = sizes.get(parent, 0) + delta
+        sizes[parent] = sizes.get(parent, 0) + size_delta
+        total_file_counts[parent] = total_file_counts.get(parent, 0) + total_file_delta
         if parent == root:
             break
         parent = os.path.dirname(parent)
@@ -309,7 +421,7 @@ def watch_worker(
         from watchdog.observers import Observer
     except ImportError:
         # Signal the UI to fall back if watchdog is unavailable.
-        result_queue.put(("watchdog-missing", {}, {}))
+        result_queue.put(("watchdog-missing", {}, {}, {}, {}))
         return
 
     dirty_paths: set = set()
@@ -318,11 +430,11 @@ def watch_worker(
 
     scanning_event.set()
     result_queue.put(("progress", 0.0))
-    sizes, children = scan_directory_with_progress(
+    sizes, file_counts, total_file_counts, children = scan_directory_with_progress(
         root, progress_cb=lambda pct: result_queue.put(("progress", pct))
     )
     scanning_event.clear()
-    result_queue.put((time.time(), sizes, children))
+    result_queue.put((time.time(), sizes, file_counts, total_file_counts, children))
 
     def mark_dirty(path: str) -> None:
         existing = nearest_existing_dir(path, root)
@@ -356,11 +468,19 @@ def watch_worker(
             total = max(1, len(targets))
             for idx, target in enumerate(targets):
                 result_queue.put(("progress", idx / total))
-                integrate_subtree(root, target, sizes, children)
+                integrate_subtree(root, target, sizes, file_counts, total_file_counts, children)
             result_queue.put(("progress", 1.0))
             scanning_event.clear()
 
-            result_queue.put((time.time(), dict(sizes), dict(children)))
+            result_queue.put(
+                (
+                    time.time(),
+                    dict(sizes),
+                    dict(file_counts),
+                    dict(total_file_counts),
+                    dict(children),
+                )
+            )
     finally:
         observer.stop()
         observer.join(timeout=1)
@@ -406,6 +526,8 @@ def tui(stdscr, root: str, interval: int, use_watch: bool) -> None:
     # Start with empty data until the first scan completes.
     initial_sizes: Dict[str, int] = {}
     current_sizes: Dict[str, int] = {}
+    file_counts: Dict[str, int] = {}
+    total_file_counts: Dict[str, int] = {}
     children: Dict[str, List[str]] = {root: []}
     expanded = {root}
     selected = 0
@@ -417,6 +539,7 @@ def tui(stdscr, root: str, interval: int, use_watch: bool) -> None:
     pos_pairs, neg_pairs = build_gradient_pairs()
     scan_progress = 0.0
     filter_deltas = False
+    sort_index = SORT_COLUMNS.index("initial")
 
     worker_target = watch_worker if use_watch else scan_worker
     worker_args = (
@@ -448,7 +571,7 @@ def tui(stdscr, root: str, interval: int, use_watch: bool) -> None:
                 scan_progress = float(result[1])
                 continue
 
-            timestamp, new_sizes, new_children = result
+            timestamp, new_sizes, new_file_counts, new_total_file_counts, new_children = result
             if timestamp == "watchdog-missing":
                 # Watchdog not installed; fall back to periodic scanning.
                 use_watch = False
@@ -465,6 +588,8 @@ def tui(stdscr, root: str, interval: int, use_watch: bool) -> None:
                 last_scan = float(timestamp)
                 scan_progress = 1.0
                 current_sizes = new_sizes
+                file_counts = new_file_counts
+                total_file_counts = new_total_file_counts
                 children = new_children
                 if not initial_sizes:
                     # First scan establishes the baseline.
@@ -483,7 +608,19 @@ def tui(stdscr, root: str, interval: int, use_watch: bool) -> None:
             next_text = f"{remaining}s"
 
         delta_map = {p: current_sizes.get(p, 0) - initial_sizes.get(p, 0) for p in current_sizes}
-        visible = build_visible(root, children, expanded, initial_sizes, delta_map, filter_deltas)
+        sort_column = SORT_COLUMNS[sort_index]
+        visible = build_visible(
+            root,
+            children,
+            expanded,
+            initial_sizes,
+            current_sizes,
+            file_counts,
+            total_file_counts,
+            delta_map,
+            filter_deltas,
+            sort_column,
+        )
         if selected >= len(visible):
             selected = max(0, len(visible) - 1)
         height, _ = stdscr.getmaxyx()
@@ -499,6 +636,9 @@ def tui(stdscr, root: str, interval: int, use_watch: bool) -> None:
             visible,
             initial_sizes,
             current_sizes,
+            file_counts,
+            total_file_counts,
+            sort_column,
             selected,
             last_scan,
             mode_text,
@@ -549,6 +689,8 @@ def tui(stdscr, root: str, interval: int, use_watch: bool) -> None:
             filter_deltas = not filter_deltas
             scroll_offset = 0
             selected = 0
+        elif key in (ord("s"),):
+            sort_index = (sort_index + 1) % len(SORT_COLUMNS)
 
         time.sleep(0.05)
 
@@ -558,7 +700,7 @@ def tui(stdscr, root: str, interval: int, use_watch: bool) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Browse folder sizes with a live-updating terminal UI."
+        description="Browse folder sizes and file counts with a live-updating terminal UI."
     )
     parser.add_argument(
         "path",
@@ -570,8 +712,8 @@ def parse_args() -> argparse.Namespace:
         "-i",
         "--interval",
         type=int,
-        default=5,
-        help="Seconds between rescans (default: 5).",
+        default=60,
+        help="Seconds between rescans (default: 60).",
     )
     return parser.parse_args()
 
